@@ -38,6 +38,7 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+	var err error
 	switch os.Args[1] {
 	case "--help", "-h":
 		printUsage()
@@ -45,9 +46,6 @@ func main() {
 	case "--version", "-v":
 		fmt.Println("sip " + version)
 		os.Exit(0)
-	}
-	var err error
-	switch os.Args[1] {
 	case "i", "install":
 		err = runInstall(os.Args[2:])
 	case "r", "remove":
@@ -110,7 +108,9 @@ func runInstall(args []string) error {
 	return installRelease(repo, name, rel)
 }
 
-func installRelease(repo, name string, rel *Release) error {
+// downloadRelease downloads, extracts, and writes metadata to pkgDir(name).
+// It does not link binaries or print the final "installed" message.
+func downloadRelease(repo, name string, rel *Release) error {
 	asset, err := pickAsset(rel.Assets)
 	if err != nil {
 		return err
@@ -171,7 +171,15 @@ func installRelease(repo, name string, rel *Release) error {
 		return err
 	}
 
-	// Detect and link binaries
+	return nil
+}
+
+func installRelease(repo, name string, rel *Release) error {
+	if err := downloadRelease(repo, name, rel); err != nil {
+		return err
+	}
+
+	dest := pkgDir(name)
 	bins, err := detectBinaries(dest)
 	if err != nil || len(bins) == 0 {
 		os.RemoveAll(dest)
@@ -211,21 +219,10 @@ func runUpgrade(args []string) error {
 	// Single-package upgrade
 	if len(args) > 0 {
 		name := args[0]
-		dir := pkgDir(name)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			return fmt.Errorf("%s is not installed", name)
-		}
-
-		repoBytes, err := os.ReadFile(filepath.Join(dir, ".repo"))
+		repo, current, err := readPkgMetadata(name)
 		if err != nil {
-			return fmt.Errorf("%s: missing .repo metadata", name)
+			return err
 		}
-		versionBytes, err := os.ReadFile(filepath.Join(dir, ".version"))
-		if err != nil {
-			return fmt.Errorf("%s: missing .version metadata", name)
-		}
-		repo := strings.TrimSpace(string(repoBytes))
-		current := strings.TrimSpace(string(versionBytes))
 
 		rel, err := fetchRelease(repo)
 		if err != nil {
@@ -255,21 +252,13 @@ func runUpgrade(args []string) error {
 			continue
 		}
 		name := e.Name()
-		dir := pkgDir(name)
 		total++
 
-		repoBytes, err := os.ReadFile(filepath.Join(dir, ".repo"))
+		repo, current, err := readPkgMetadata(name)
 		if err != nil {
-			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, fmt.Errorf("missing .repo metadata"))
+			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, err)
 			continue
 		}
-		versionBytes, err := os.ReadFile(filepath.Join(dir, ".version"))
-		if err != nil {
-			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, fmt.Errorf("missing .version metadata"))
-			continue
-		}
-		repo := strings.TrimSpace(string(repoBytes))
-		current := strings.TrimSpace(string(versionBytes))
 
 		rel, err := fetchRelease(repo)
 		if err != nil {
@@ -304,15 +293,11 @@ func atomicUpgrade(name, repo string, rel *Release) error {
 	// Clean up any leftover staging dir
 	os.RemoveAll(stagingDir)
 
-	// Install new version to staging directory
-	if err := installRelease(repo, stagingName, rel); err != nil {
+	// Download new version to staging directory (no bin linking)
+	if err := downloadRelease(repo, stagingName, rel); err != nil {
 		os.RemoveAll(stagingDir)
-		unlinkBins(stagingName)
 		return err
 	}
-
-	// Unlink staging bins (installRelease linked them under the staging name)
-	unlinkBins(stagingName)
 
 	// Swap: remove old, rename staging to final
 	oldDir := pkgDir(name)
@@ -323,10 +308,12 @@ func atomicUpgrade(name, repo string, rel *Release) error {
 		return err
 	}
 
-	// Re-detect and link binaries from the final location
+	// Detect and link binaries from the final location
 	bins, _ := detectBinaries(oldDir)
 	if len(bins) > 0 {
-		linkBins(name, bins)
+		if err := linkBins(name, bins); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -786,6 +773,19 @@ func pkgDir(name string) string {
 
 func binDir() string {
 	return filepath.Join(sipDir(), "bin")
+}
+
+func readPkgMetadata(name string) (repo, version string, err error) {
+	dir := pkgDir(name)
+	repoBytes, rerr := os.ReadFile(filepath.Join(dir, ".repo"))
+	if rerr != nil {
+		return "", "", fmt.Errorf("%s: missing .repo metadata", name)
+	}
+	versionBytes, verr := os.ReadFile(filepath.Join(dir, ".version"))
+	if verr != nil {
+		return "", "", fmt.Errorf("%s: missing .version metadata", name)
+	}
+	return strings.TrimSpace(string(repoBytes)), strings.TrimSpace(string(versionBytes)), nil
 }
 
 func color(code, msg string) string {
