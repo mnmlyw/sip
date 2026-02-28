@@ -12,7 +12,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
+
+const version = "0.1.0"
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
 
 // --- Types ---
 
@@ -32,6 +37,14 @@ func main() {
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
+	}
+	switch os.Args[1] {
+	case "--help", "-h":
+		printUsage()
+		os.Exit(0)
+	case "--version", "-v":
+		fmt.Println("sip " + version)
+		os.Exit(0)
 	}
 	var err error
 	switch os.Args[1] {
@@ -63,7 +76,7 @@ func printUsage() {
 usage:
   sip i <owner/repo>   install a package
   sip r <name>          remove a package
-  sip u                 upgrade all packages
+  sip u [name]          upgrade all or one package
   sip l                 list installed packages
   sip s <query>         search installed packages
   sip n <name>          show package info
@@ -94,6 +107,10 @@ func runInstall(args []string) error {
 		return err
 	}
 
+	return installRelease(repo, name, rel)
+}
+
+func installRelease(repo, name string, rel *Release) error {
 	asset, err := pickAsset(rel.Assets)
 	if err != nil {
 		return err
@@ -145,8 +162,14 @@ func runInstall(args []string) error {
 	}
 
 	// Write metadata
-	os.WriteFile(filepath.Join(dest, ".repo"), []byte(repo), 0o644)
-	os.WriteFile(filepath.Join(dest, ".version"), []byte(rel.TagName), 0o644)
+	if err := os.WriteFile(filepath.Join(dest, ".repo"), []byte(repo), 0o644); err != nil {
+		os.RemoveAll(dest)
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(dest, ".version"), []byte(rel.TagName), 0o644); err != nil {
+		os.RemoveAll(dest)
+		return err
+	}
 
 	// Detect and link binaries
 	bins, err := detectBinaries(dest)
@@ -185,25 +208,64 @@ func runRemove(args []string) error {
 }
 
 func runUpgrade(args []string) error {
+	// Single-package upgrade
+	if len(args) > 0 {
+		name := args[0]
+		dir := pkgDir(name)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			return fmt.Errorf("%s is not installed", name)
+		}
+
+		repoBytes, err := os.ReadFile(filepath.Join(dir, ".repo"))
+		if err != nil {
+			return fmt.Errorf("%s: missing .repo metadata", name)
+		}
+		versionBytes, err := os.ReadFile(filepath.Join(dir, ".version"))
+		if err != nil {
+			return fmt.Errorf("%s: missing .version metadata", name)
+		}
+		repo := strings.TrimSpace(string(repoBytes))
+		current := strings.TrimSpace(string(versionBytes))
+
+		rel, err := fetchRelease(repo)
+		if err != nil {
+			return err
+		}
+		if rel.TagName == current {
+			fmt.Printf("%s %s (%s)\n", color("90", "up-to-date"), name, current)
+			return nil
+		}
+
+		fmt.Printf("%s %s %s → %s\n", color("36", "upgrading"), name, current, rel.TagName)
+		if err := atomicUpgrade(name, repo, rel); err != nil {
+			return err
+		}
+		fmt.Printf("%s %s (%s)\n", color("32", "upgraded"), name, rel.TagName)
+		return nil
+	}
+
 	entries, err := os.ReadDir(filepath.Join(sipDir(), "pkg"))
 	if err != nil {
 		return fmt.Errorf("nothing installed")
 	}
 
-	var upgraded int
+	var upgraded, total int
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		name := e.Name()
 		dir := pkgDir(name)
+		total++
 
 		repoBytes, err := os.ReadFile(filepath.Join(dir, ".repo"))
 		if err != nil {
+			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, fmt.Errorf("missing .repo metadata"))
 			continue
 		}
 		versionBytes, err := os.ReadFile(filepath.Join(dir, ".version"))
 		if err != nil {
+			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, fmt.Errorf("missing .version metadata"))
 			continue
 		}
 		repo := strings.TrimSpace(string(repoBytes))
@@ -222,62 +284,49 @@ func runUpgrade(args []string) error {
 
 		fmt.Printf("%s %s %s → %s\n", color("36", "upgrading"), name, current, rel.TagName)
 
-		// Remove old
-		unlinkBins(name)
-		os.RemoveAll(dir)
-
-		// Reinstall
-		asset, err := pickAsset(rel.Assets)
-		if err != nil {
+		if err := atomicUpgrade(name, repo, rel); err != nil {
 			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, err)
 			continue
 		}
 
-		tmp, err := os.CreateTemp("", "sip-*-"+asset.Name)
-		if err != nil {
-			continue
-		}
-		tmpPath := tmp.Name()
-		tmp.Close()
-
-		if err := download(asset.URL, tmpPath); err != nil {
-			os.Remove(tmpPath)
-			continue
-		}
-
-		os.MkdirAll(dir, 0o755)
-
-		lower := strings.ToLower(asset.Name)
-		switch {
-		case strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz"):
-			err = extractTarGz(tmpPath, dir)
-		case strings.HasSuffix(lower, ".zip"):
-			err = extractZip(tmpPath, dir)
-		default:
-			bin := filepath.Join(dir, name)
-			err = copyFile(tmpPath, bin)
-			if err == nil {
-				os.Chmod(bin, 0o755)
-			}
-		}
-		os.Remove(tmpPath)
-		if err != nil {
-			continue
-		}
-
-		os.WriteFile(filepath.Join(dir, ".repo"), []byte(repo), 0o644)
-		os.WriteFile(filepath.Join(dir, ".version"), []byte(rel.TagName), 0o644)
-
-		bins, _ := detectBinaries(dir)
-		if len(bins) > 0 {
-			linkBins(name, bins)
-		}
 		upgraded++
 		fmt.Printf("%s %s (%s)\n", color("32", "upgraded"), name, rel.TagName)
 	}
 
-	if upgraded == 0 {
-		fmt.Println("everything up-to-date")
+	fmt.Printf("upgraded %d/%d packages\n", upgraded, total)
+	return nil
+}
+
+func atomicUpgrade(name, repo string, rel *Release) error {
+	stagingName := name + ".new"
+	stagingDir := pkgDir(stagingName)
+
+	// Clean up any leftover staging dir
+	os.RemoveAll(stagingDir)
+
+	// Install new version to staging directory
+	if err := installRelease(repo, stagingName, rel); err != nil {
+		os.RemoveAll(stagingDir)
+		unlinkBins(stagingName)
+		return err
+	}
+
+	// Unlink staging bins (installRelease linked them under the staging name)
+	unlinkBins(stagingName)
+
+	// Swap: remove old, rename staging to final
+	oldDir := pkgDir(name)
+	unlinkBins(name)
+	os.RemoveAll(oldDir)
+
+	if err := os.Rename(stagingDir, oldDir); err != nil {
+		return err
+	}
+
+	// Re-detect and link binaries from the final location
+	bins, _ := detectBinaries(oldDir)
+	if len(bins) > 0 {
+		linkBins(name, bins)
 	}
 	return nil
 }
@@ -375,7 +424,7 @@ func fetchRelease(repo string) (*Release, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +470,7 @@ func pickAsset(assets []Asset) (*Asset, error) {
 				s += 10
 			}
 		case "windows":
-			if strings.Contains(name, "windows") || strings.Contains(name, "win") {
+			if strings.Contains(name, "windows") || strings.Contains(name, "win64") || strings.Contains(name, "win32") {
 				s += 10
 			}
 		}
@@ -449,7 +498,7 @@ func pickAsset(assets []Asset) (*Asset, error) {
 		if goos != "linux" && strings.Contains(name, "linux") {
 			s -= 100
 		}
-		if goos != "windows" && (strings.Contains(name, "windows") || strings.Contains(name, ".exe") || strings.Contains(name, ".msi")) {
+		if goos != "windows" && (strings.Contains(name, "windows") || strings.Contains(name, "win64") || strings.Contains(name, "win32") || strings.Contains(name, ".exe") || strings.Contains(name, ".msi")) {
 			s -= 100
 		}
 		if goos != "darwin" && (strings.Contains(name, "darwin") || strings.Contains(name, "macos")) {
@@ -502,7 +551,7 @@ func download(url, dest string) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -516,10 +565,13 @@ func download(url, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
-	_, err = io.Copy(f, resp.Body)
-	return err
+	_, copyErr := io.Copy(f, io.LimitReader(resp.Body, 1<<30))
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 // --- Cellar ---
@@ -562,7 +614,7 @@ func extractTarGz(archive, dest string) error {
 		}
 
 		target := filepath.Join(dest, name)
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode)|0o755)
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode))
 		if err != nil {
 			return err
 		}
@@ -599,7 +651,7 @@ func extractZip(archive, dest string) error {
 			return err
 		}
 
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, f.Mode()|0o755)
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, f.Mode())
 		if err != nil {
 			rc.Close()
 			return err
@@ -720,7 +772,11 @@ func unlinkBins(name string) {
 // --- Helpers ---
 
 func sipDir() string {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, color("31", "error: ")+"cannot determine home directory: "+err.Error())
+		os.Exit(1)
+	}
 	return filepath.Join(home, ".sip")
 }
 
@@ -747,8 +803,11 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	_, err = io.Copy(out, in)
-	return err
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
