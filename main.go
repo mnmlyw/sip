@@ -7,17 +7,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
 const version = "0.1.0"
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 10,
+		DialContext:         (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+	},
+}
 
 // --- Types ---
 
@@ -246,43 +254,67 @@ func runUpgrade(args []string) error {
 		return fmt.Errorf("nothing installed")
 	}
 
-	var upgraded, total int
+	// Phase 1: Read metadata (local) and fetch releases (network) in parallel
+	type pkgInfo struct {
+		name, repo, current string
+	}
+	type fetchResult struct {
+		rel *Release
+		err error
+	}
+
+	var pkgs []pkgInfo
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		total++
-
 		repo, current, err := readPkgMetadata(name)
 		if err != nil {
 			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, err)
 			continue
 		}
+		pkgs = append(pkgs, pkgInfo{name, repo, current})
+	}
 
-		rel, err := fetchRelease(repo)
-		if err != nil {
-			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, err)
+	results := make([]fetchResult, len(pkgs))
+	var wg sync.WaitGroup
+	for i, p := range pkgs {
+		wg.Add(1)
+		go func(i int, repo string) {
+			defer wg.Done()
+			rel, err := fetchRelease(repo)
+			results[i] = fetchResult{rel, err}
+		}(i, p.repo)
+	}
+	wg.Wait()
+
+	// Phase 2: Process results sequentially
+	var upgraded int
+	for i, p := range pkgs {
+		if results[i].err != nil {
+			fmt.Printf("%s %s: %v\n", color("33", "skip"), p.name, results[i].err)
+			continue
+		}
+		rel := results[i].rel
+
+		if rel.TagName == p.current {
+			fmt.Printf("%s %s (%s)\n", color("90", "up-to-date"), p.name, p.current)
 			continue
 		}
 
-		if rel.TagName == current {
-			fmt.Printf("%s %s (%s)\n", color("90", "up-to-date"), name, current)
-			continue
-		}
+		fmt.Printf("%s %s %s → %s\n", color("36", "upgrading"), p.name, p.current, rel.TagName)
 
-		fmt.Printf("%s %s %s → %s\n", color("36", "upgrading"), name, current, rel.TagName)
-
-		if err := atomicUpgrade(name, repo, rel); err != nil {
-			fmt.Printf("%s %s: %v\n", color("33", "skip"), name, err)
+		if err := atomicUpgrade(p.name, p.repo, rel); err != nil {
+			fmt.Printf("%s %s: %v\n", color("33", "skip"), p.name, err)
 			continue
 		}
 
 		upgraded++
-		fmt.Printf("%s %s (%s)\n", color("32", "upgraded"), name, rel.TagName)
+		fmt.Printf("%s %s (%s)\n", color("32", "upgraded"), p.name, rel.TagName)
 	}
 
-	fmt.Printf("upgraded %d/%d packages\n", upgraded, total)
+	fmt.Printf("upgraded %d/%d packages\n", upgraded, len(pkgs))
 	return nil
 }
 
@@ -739,12 +771,16 @@ func linkBins(name string, bins []string) error {
 
 func unlinkBins(name string) {
 	bdir := binDir()
-	entries, err := os.ReadDir(bdir)
+	pdir := pkgDir(name)
+	entries, err := os.ReadDir(pdir)
 	if err != nil {
 		return
 	}
 	prefix := filepath.Join("..", "pkg", name) + string(os.PathSeparator)
 	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
 		link := filepath.Join(bdir, e.Name())
 		target, err := os.Readlink(link)
 		if err != nil {
@@ -758,13 +794,21 @@ func unlinkBins(name string) {
 
 // --- Helpers ---
 
+var (
+	sipDirOnce  sync.Once
+	sipDirValue string
+)
+
 func sipDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, color("31", "error: ")+"cannot determine home directory: "+err.Error())
-		os.Exit(1)
-	}
-	return filepath.Join(home, ".sip")
+	sipDirOnce.Do(func() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, color("31", "error: ")+"cannot determine home directory: "+err.Error())
+			os.Exit(1)
+		}
+		sipDirValue = filepath.Join(home, ".sip")
+	})
+	return sipDirValue
 }
 
 func pkgDir(name string) string {
