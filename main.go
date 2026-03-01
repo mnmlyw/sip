@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"archive/zip"
+	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -126,47 +127,59 @@ func downloadRelease(repo, name string, rel *Release) error {
 
 	fmt.Printf("%s %s (%s)\n", color("36", "downloading"), asset.Name, rel.TagName)
 
-	// Download to temp file
-	tmp, err := os.CreateTemp("", "sip-*-"+asset.Name)
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	tmp.Close()
-	defer os.Remove(tmpPath)
-
-	if err := download(asset.URL, tmpPath); err != nil {
-		return err
-	}
-
 	// Prepare pkg dir
 	dest := pkgDir(name)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
 
-	// Extract
-	fmt.Printf("%s %s\n", color("36", "extracting"), asset.Name)
 	lower := strings.ToLower(asset.Name)
-	switch {
-	case strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz"):
-		if err := extractTarGz(tmpPath, dest); err != nil {
+	if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") {
+		// Stream tar.gz directly from HTTP — no temp file
+		resp, err := httpGet(asset.URL)
+		if err != nil {
 			os.RemoveAll(dest)
 			return err
 		}
-	case strings.HasSuffix(lower, ".zip"):
-		if err := extractZip(tmpPath, dest); err != nil {
+		defer resp.Body.Close()
+
+		fmt.Printf("%s %s\n", color("36", "extracting"), asset.Name)
+		if err := streamTarGz(resp.Body, dest); err != nil {
 			os.RemoveAll(dest)
 			return err
 		}
-	default:
-		// Raw binary
-		bin := filepath.Join(dest, name)
-		if err := copyFile(tmpPath, bin); err != nil {
+	} else {
+		// Download to temp file for zip / raw binary
+		tmp, err := os.CreateTemp("", "sip-*-"+asset.Name)
+		if err != nil {
 			os.RemoveAll(dest)
 			return err
 		}
-		os.Chmod(bin, 0o755)
+		tmpPath := tmp.Name()
+		tmp.Close()
+		defer os.Remove(tmpPath)
+
+		if err := download(asset.URL, tmpPath); err != nil {
+			os.RemoveAll(dest)
+			return err
+		}
+
+		fmt.Printf("%s %s\n", color("36", "extracting"), asset.Name)
+		switch {
+		case strings.HasSuffix(lower, ".zip"):
+			if err := extractZip(tmpPath, dest); err != nil {
+				os.RemoveAll(dest)
+				return err
+			}
+		default:
+			// Raw binary
+			bin := filepath.Join(dest, name)
+			if err := copyFile(tmpPath, bin); err != nil {
+				os.RemoveAll(dest)
+				return err
+			}
+			os.Chmod(bin, 0o755)
+		}
 	}
 
 	// Write metadata
@@ -289,29 +302,50 @@ func runUpgrade(args []string) error {
 	}
 	wg.Wait()
 
-	// Phase 2: Process results sequentially
-	var upgraded int
+	// Phase 2: Filter up-to-date packages, upgrade the rest in parallel
+	type upgradeJob struct {
+		idx  int
+		pkg  pkgInfo
+		rel  *Release
+	}
+
+	var jobs []upgradeJob
 	for i, p := range pkgs {
 		if results[i].err != nil {
 			fmt.Printf("%s %s: %v\n", color("33", "skip"), p.name, results[i].err)
 			continue
 		}
 		rel := results[i].rel
-
 		if rel.TagName == p.current {
 			fmt.Printf("%s %s (%s)\n", color("90", "up-to-date"), p.name, p.current)
 			continue
 		}
-
 		fmt.Printf("%s %s %s → %s\n", color("36", "upgrading"), p.name, p.current, rel.TagName)
+		jobs = append(jobs, upgradeJob{i, p, rel})
+	}
 
-		if err := atomicUpgrade(p.name, p.repo, rel); err != nil {
-			fmt.Printf("%s %s: %v\n", color("33", "skip"), p.name, err)
+	upgradeResults := make([]error, len(jobs))
+	sem := make(chan struct{}, 4)
+	var wg2 sync.WaitGroup
+	for j, job := range jobs {
+		wg2.Add(1)
+		go func(j int, job upgradeJob) {
+			defer wg2.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			upgradeResults[j] = atomicUpgrade(job.pkg.name, job.pkg.repo, job.rel)
+		}(j, job)
+	}
+	wg2.Wait()
+
+	var upgraded int
+	for j, job := range jobs {
+		if upgradeResults[j] != nil {
+			fmt.Printf("%s %s: %v\n", color("33", "skip"), job.pkg.name, upgradeResults[j])
 			continue
 		}
-
 		upgraded++
-		fmt.Printf("%s %s (%s)\n", color("32", "upgraded"), p.name, rel.TagName)
+		fmt.Printf("%s %s (%s)\n", color("32", "upgraded"), job.pkg.name, job.rel.TagName)
 	}
 
 	fmt.Printf("upgraded %d/%d packages\n", upgraded, len(pkgs))
@@ -561,10 +595,10 @@ func pickAsset(assets []Asset) (*Asset, error) {
 	return &best.asset, nil
 }
 
-func download(url, dest string) error {
+func httpGet(url string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -572,42 +606,52 @@ func download(url, dest string) error {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		resp.Body.Close()
+		return nil, fmt.Errorf("download failed: %s", resp.Status)
+	}
+	return resp, nil
+}
+
+func download(url, dest string) error {
+	resp, err := httpGet(url)
+	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("download failed: %s", resp.Status)
-	}
 
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 
-	_, copyErr := io.Copy(f, io.LimitReader(resp.Body, 1<<30))
+	bw := bufio.NewWriterSize(f, 256*1024)
+	_, copyErr := io.Copy(bw, io.LimitReader(resp.Body, 1<<30))
+	flushErr := bw.Flush()
 	closeErr := f.Close()
 	if copyErr != nil {
 		return copyErr
+	}
+	if flushErr != nil {
+		return flushErr
 	}
 	return closeErr
 }
 
 // --- Cellar ---
 
-func extractTarGz(archive, dest string) error {
-	f, err := os.Open(archive)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	gz, err := gzip.NewReader(f)
+// streamTarGz decompresses and extracts a tar.gz stream directly into dest.
+func streamTarGz(r io.Reader, dest string) error {
+	br := bufio.NewReaderSize(r, 128*1024)
+	gz, err := gzip.NewReader(br)
 	if err != nil {
 		return err
 	}
 	defer gz.Close()
 
+	buf := make([]byte, 256*1024)
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
@@ -618,7 +662,6 @@ func extractTarGz(archive, dest string) error {
 			return err
 		}
 
-		// Skip directories and non-regular files
 		if hdr.Typeflag == tar.TypeDir {
 			continue
 		}
@@ -626,7 +669,6 @@ func extractTarGz(archive, dest string) error {
 			continue
 		}
 
-		// Flatten: extract all files directly into dest
 		name := filepath.Base(hdr.Name)
 		if name == "." || name == ".." {
 			continue
@@ -637,7 +679,12 @@ func extractTarGz(archive, dest string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := io.Copy(out, tr); err != nil {
+		bw := bufio.NewWriter(out)
+		if _, err := io.CopyBuffer(bw, tr, buf); err != nil {
+			out.Close()
+			return err
+		}
+		if err := bw.Flush(); err != nil {
 			out.Close()
 			return err
 		}
@@ -653,6 +700,7 @@ func extractZip(archive, dest string) error {
 	}
 	defer r.Close()
 
+	buf := make([]byte, 256*1024)
 	for _, f := range r.File {
 		if f.FileInfo().IsDir() {
 			continue
@@ -675,7 +723,13 @@ func extractZip(archive, dest string) error {
 			rc.Close()
 			return err
 		}
-		if _, err := io.Copy(out, rc); err != nil {
+		bw := bufio.NewWriter(out)
+		if _, err := io.CopyBuffer(bw, rc, buf); err != nil {
+			out.Close()
+			rc.Close()
+			return err
+		}
+		if err := bw.Flush(); err != nil {
 			out.Close()
 			rc.Close()
 			return err
@@ -692,6 +746,7 @@ func detectBinaries(dir string) ([]string, error) {
 		return nil, err
 	}
 
+	var magic [4]byte
 	var bins []string
 	for _, e := range entries {
 		if e.IsDir() {
@@ -709,46 +764,43 @@ func detectBinaries(dir string) ([]string, error) {
 			continue
 		}
 		path := filepath.Join(dir, name)
-		if isExecutableBinary(path) {
+
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		_, err = io.ReadFull(f, magic[:])
+		f.Close()
+		if err != nil {
+			continue
+		}
+
+		// ELF
+		if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
 			bins = append(bins, path)
+			continue
+		}
+		// Mach-O (32/64-bit, big/little endian)
+		if magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && (magic[3] == 0xce || magic[3] == 0xcf) {
+			bins = append(bins, path)
+			continue
+		}
+		if (magic[0] == 0xce || magic[0] == 0xcf) && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe {
+			bins = append(bins, path)
+			continue
+		}
+		// Mach-O fat/universal binary
+		if magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
+			bins = append(bins, path)
+			continue
+		}
+		// Windows PE
+		if magic[0] == 'M' && magic[1] == 'Z' {
+			bins = append(bins, path)
+			continue
 		}
 	}
 	return bins, nil
-}
-
-// isExecutableBinary checks file magic bytes for ELF, Mach-O, or Windows PE.
-func isExecutableBinary(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	var magic [4]byte
-	if _, err := io.ReadFull(f, magic[:]); err != nil {
-		return false
-	}
-
-	// ELF
-	if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
-		return true
-	}
-	// Mach-O (32/64-bit, big/little endian)
-	if magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && (magic[3] == 0xce || magic[3] == 0xcf) {
-		return true
-	}
-	if (magic[0] == 0xce || magic[0] == 0xcf) && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe {
-		return true
-	}
-	// Mach-O fat/universal binary
-	if magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
-		return true
-	}
-	// Windows PE
-	if magic[0] == 'M' && magic[1] == 'Z' {
-		return true
-	}
-	return false
 }
 
 func linkBins(name string, bins []string) error {
