@@ -29,12 +29,14 @@ fish_add_path ~/.sip/bin
 ## Usage
 
 ```
-sip i BurntSushi/ripgrep     # install
-sip r ripgrep                # remove
-sip u                        # upgrade all
-sip l                        # list installed
-sip s rip                    # search installed
-sip n ripgrep                # info
+sip i BurntSushi/ripgrep         # install latest
+sip i BurntSushi/ripgrep@14.1.0  # pin a version
+sip r ripgrep                    # remove
+sip u                            # upgrade all
+sip u ripgrep                    # upgrade one
+sip l                            # list installed
+sip s rip                        # search installed
+sip n ripgrep                    # info
 ```
 
 ## How it works
@@ -55,4 +57,6 @@ sip downloads the latest release from GitHub, picks the right binary for your pl
 
 No JSON state, no cache — everything is derived from the filesystem.
 
-Asset selection scores each release artifact by OS, architecture, and format, then picks the best match. Supports `GITHUB_TOKEN` for API rate limits.
+Asset selection scores each release artifact by OS, architecture, and format, then picks the best match. Recognizes Rust-style triples (`x86_64-unknown-linux-gnu`), prefers glibc over musl on Linux, and supports `.tar.gz` and `.zip` archives. `GITHUB_TOKEN` is honored for API rate limits.
+
+When a release publishes a SHA-256 checksum (`<asset>.sha256` or a `SHA256SUMS`/`checksums.txt` aggregate), sip verifies the download against it and aborts on mismatch.

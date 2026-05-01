@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"bufio"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +20,7 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
@@ -81,35 +83,53 @@ func printUsage() {
 	fmt.Print(`sip — a tiny package manager
 
 usage:
-  sip i <owner/repo>   install a package
-  sip r <name>          remove a package
-  sip u [name]          upgrade all or one package
-  sip l                 list installed packages
-  sip s <query>         search installed packages
-  sip n <name>          show package info
+  sip i <owner/repo>[@version]   install a package (latest or pinned)
+  sip r <name>                   remove a package
+  sip u [name]                   upgrade all or one package
+  sip l                          list installed packages
+  sip s <query>                  search installed packages
+  sip n <name>                   show package info
 `)
 }
 
 // --- Commands ---
 
+func parseRepoSpec(spec string) (repo, tag string, err error) {
+	if r, t, ok := strings.Cut(spec, "@"); ok {
+		if t == "" {
+			return "", "", fmt.Errorf("empty version in %q", spec)
+		}
+		repo, tag = r, t
+	} else {
+		repo = spec
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" {
+		return "", "", fmt.Errorf("invalid repo format, expected owner/repo[@version]")
+	}
+	return repo, tag, nil
+}
+
 func runInstall(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: sip i <owner/repo>")
+		return fmt.Errorf("usage: sip i <owner/repo>[@version]")
 	}
-	repo := args[0]
-	parts := strings.SplitN(repo, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return fmt.Errorf("invalid repo format, expected owner/repo")
+	repo, tag, err := parseRepoSpec(args[0])
+	if err != nil {
+		return err
 	}
-	name := parts[1]
+	_, name, _ := strings.Cut(repo, "/")
 
-	// Check if already installed
 	if _, err := os.Stat(pkgDir(name)); err == nil {
 		return fmt.Errorf("%s is already installed", name)
 	}
 
-	fmt.Printf("%s %s\n", color("36", "fetching"), repo)
-	rel, err := fetchRelease(repo)
+	if tag == "" {
+		fmt.Printf("%s %s\n", color("36", "fetching"), repo)
+	} else {
+		fmt.Printf("%s %s@%s\n", color("36", "fetching"), repo, tag)
+	}
+	rel, err := fetchRelease(repo, tag)
 	if err != nil {
 		return err
 	}
@@ -117,7 +137,7 @@ func runInstall(args []string) error {
 	return installRelease(repo, name, rel)
 }
 
-// downloadRelease downloads, extracts, and writes metadata to pkgDir(name).
+// downloadRelease downloads, verifies, extracts, and writes metadata to pkgDir(name).
 // It does not link binaries or print the final "installed" message.
 func downloadRelease(repo, name string, rel *Release) error {
 	asset, err := pickAsset(rel.Assets)
@@ -125,9 +145,10 @@ func downloadRelease(repo, name string, rel *Release) error {
 		return err
 	}
 
+	expected := findExpectedSum(rel.Assets, asset.Name)
+
 	fmt.Printf("%s %s (%s)\n", color("36", "downloading"), asset.Name, rel.TagName)
 
-	// Prepare pkg dir
 	dest := pkgDir(name)
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
@@ -135,7 +156,7 @@ func downloadRelease(repo, name string, rel *Release) error {
 
 	lower := strings.ToLower(asset.Name)
 	if strings.HasSuffix(lower, ".tar.gz") || strings.HasSuffix(lower, ".tgz") {
-		// Stream tar.gz directly from HTTP — no temp file
+		// Stream tar.gz directly from HTTP — no temp file, but hash on the fly.
 		resp, err := httpGet(asset.URL)
 		if err != nil {
 			os.RemoveAll(dest)
@@ -144,12 +165,23 @@ func downloadRelease(repo, name string, rel *Release) error {
 		defer resp.Body.Close()
 
 		fmt.Printf("%s %s\n", color("36", "extracting"), asset.Name)
-		if err := streamTarGz(resp.Body, dest); err != nil {
+		hasher := sha256.New()
+		tee := io.TeeReader(resp.Body, hasher)
+		if err := streamTarGz(tee, dest); err != nil {
 			os.RemoveAll(dest)
 			return err
 		}
+		// Drain anything past the gzip footer so the hash covers the full body.
+		io.Copy(io.Discard, tee)
+		if expected != "" {
+			got := hex.EncodeToString(hasher.Sum(nil))
+			if !strings.EqualFold(got, expected) {
+				os.RemoveAll(dest)
+				return fmt.Errorf("checksum mismatch for %s\n  expected: %s\n  got:      %s", asset.Name, expected, got)
+			}
+			fmt.Printf("%s %s\n", color("32", "verified"), shortHash(got))
+		}
 	} else {
-		// Download to temp file for zip / raw binary
 		tmp, err := os.CreateTemp("", "sip-*-"+asset.Name)
 		if err != nil {
 			os.RemoveAll(dest)
@@ -159,9 +191,17 @@ func downloadRelease(repo, name string, rel *Release) error {
 		tmp.Close()
 		defer os.Remove(tmpPath)
 
-		if err := download(asset.URL, tmpPath); err != nil {
+		sum, err := download(asset.URL, tmpPath)
+		if err != nil {
 			os.RemoveAll(dest)
 			return err
+		}
+		if expected != "" {
+			if !strings.EqualFold(sum, expected) {
+				os.RemoveAll(dest)
+				return fmt.Errorf("checksum mismatch for %s\n  expected: %s\n  got:      %s", asset.Name, expected, sum)
+			}
+			fmt.Printf("%s %s\n", color("32", "verified"), shortHash(sum))
 		}
 
 		fmt.Printf("%s %s\n", color("36", "extracting"), asset.Name)
@@ -182,7 +222,6 @@ func downloadRelease(repo, name string, rel *Release) error {
 		}
 	}
 
-	// Write metadata
 	if err := os.WriteFile(filepath.Join(dest, ".repo"), []byte(repo), 0o644); err != nil {
 		os.RemoveAll(dest)
 		return err
@@ -207,7 +246,7 @@ func installRelease(repo, name string, rel *Release) error {
 		return fmt.Errorf("no binaries found in release")
 	}
 
-	if err := linkBins(name, bins); err != nil {
+	if err := linkBins(bins); err != nil {
 		os.RemoveAll(dest)
 		return err
 	}
@@ -245,7 +284,7 @@ func runUpgrade(args []string) error {
 			return err
 		}
 
-		rel, err := fetchRelease(repo)
+		rel, err := fetchRelease(repo, "")
 		if err != nil {
 			return err
 		}
@@ -267,7 +306,6 @@ func runUpgrade(args []string) error {
 		return fmt.Errorf("nothing installed")
 	}
 
-	// Phase 1: Read metadata (local) and fetch releases (network) in parallel
 	type pkgInfo struct {
 		name, repo, current string
 	}
@@ -296,17 +334,16 @@ func runUpgrade(args []string) error {
 		wg.Add(1)
 		go func(i int, repo string) {
 			defer wg.Done()
-			rel, err := fetchRelease(repo)
+			rel, err := fetchRelease(repo, "")
 			results[i] = fetchResult{rel, err}
 		}(i, p.repo)
 	}
 	wg.Wait()
 
-	// Phase 2: Filter up-to-date packages, upgrade the rest in parallel
 	type upgradeJob struct {
-		idx  int
-		pkg  pkgInfo
-		rel  *Release
+		idx int
+		pkg pkgInfo
+		rel *Release
 	}
 
 	var jobs []upgradeJob
@@ -356,16 +393,13 @@ func atomicUpgrade(name, repo string, rel *Release) error {
 	stagingName := name + ".new"
 	stagingDir := pkgDir(stagingName)
 
-	// Clean up any leftover staging dir
 	os.RemoveAll(stagingDir)
 
-	// Download new version to staging directory (no bin linking)
 	if err := downloadRelease(repo, stagingName, rel); err != nil {
 		os.RemoveAll(stagingDir)
 		return err
 	}
 
-	// Swap: remove old, rename staging to final
 	oldDir := pkgDir(name)
 	unlinkBins(name)
 	os.RemoveAll(oldDir)
@@ -374,10 +408,9 @@ func atomicUpgrade(name, repo string, rel *Release) error {
 		return err
 	}
 
-	// Detect and link binaries from the final location
 	bins, _ := detectBinaries(oldDir)
 	if len(bins) > 0 {
-		if err := linkBins(name, bins); err != nil {
+		if err := linkBins(bins); err != nil {
 			return err
 		}
 	}
@@ -466,8 +499,13 @@ func runInfo(args []string) error {
 
 // --- GitHub ---
 
-func fetchRelease(repo string) (*Release, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+func fetchRelease(repo, tag string) (*Release, error) {
+	var url string
+	if tag == "" {
+		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+	} else {
+		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
+	}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -483,6 +521,9 @@ func fetchRelease(repo string) (*Release, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == 404 && tag != "" {
+		return nil, fmt.Errorf("release %s not found in %s", tag, repo)
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("github api: %s", resp.Status)
 	}
@@ -494,105 +535,269 @@ func fetchRelease(repo string) (*Release, error) {
 	return &rel, nil
 }
 
+// scoreAsset returns a relevance score and whether the asset is supported.
+// Assets with negative scores or unsupported formats are rejected.
+func scoreAsset(name string) (score int, supported bool) {
+	n := strings.ToLower(name)
+	goos := runtime.GOOS
+	goarch := runtime.GOARCH
+
+	// Skip known non-binary metadata files.
+	for _, suf := range []string{".sha256", ".sha256sum", ".sha512", ".sig", ".asc", ".sbom", ".pem", ".cert", ".crt", ".txt", ".json", ".yaml", ".yml", ".md"} {
+		if strings.HasSuffix(n, suf) {
+			return 0, false
+		}
+	}
+	// SHA256SUMS-style aggregate files.
+	base := strings.ToLower(filepath.Base(n))
+	if base == "sha256sums" || base == "checksums" || strings.HasPrefix(base, "checksums.") || strings.HasPrefix(base, "sha256sums.") {
+		return 0, false
+	}
+
+	// Format support & preference. xz/zst rejected — no stdlib decoder.
+	format := 0
+	switch {
+	case strings.HasSuffix(n, ".tar.gz"), strings.HasSuffix(n, ".tgz"):
+		format = 5
+	case strings.HasSuffix(n, ".zip"):
+		format = 3
+	case strings.HasSuffix(n, ".tar.xz"), strings.HasSuffix(n, ".txz"),
+		strings.HasSuffix(n, ".tar.zst"), strings.HasSuffix(n, ".tzst"),
+		strings.HasSuffix(n, ".tar.bz2"), strings.HasSuffix(n, ".tbz2"),
+		strings.HasSuffix(n, ".7z"), strings.HasSuffix(n, ".rar"),
+		strings.HasSuffix(n, ".deb"), strings.HasSuffix(n, ".rpm"),
+		strings.HasSuffix(n, ".dmg"), strings.HasSuffix(n, ".pkg"),
+		strings.HasSuffix(n, ".apk"), strings.HasSuffix(n, ".AppImage"),
+		strings.HasSuffix(n, ".snap"), strings.HasSuffix(n, ".msi"):
+		return 0, false
+	default:
+		// Treat as raw binary — only if no extension or just .exe.
+		if strings.Contains(n, ".") && !strings.HasSuffix(n, ".exe") {
+			// Has a dot but unrecognized extension — risky.
+			return 0, false
+		}
+		format = 1
+	}
+
+	s := format
+
+	// OS scoring. Reject hard mismatches.
+	osHits := map[string][]string{
+		"darwin":  {"darwin", "macos", "apple", "osx"},
+		"linux":   {"linux"},
+		"windows": {"windows", "win64", "win32", ".exe"},
+		"freebsd": {"freebsd"},
+		"openbsd": {"openbsd"},
+		"netbsd":  {"netbsd"},
+	}
+	otherOS := func(self string) []string {
+		var out []string
+		for o, kws := range osHits {
+			if o == self {
+				continue
+			}
+			out = append(out, kws...)
+		}
+		return out
+	}
+	if hits, ok := osHits[goos]; ok {
+		for _, kw := range hits {
+			if strings.Contains(n, kw) {
+				s += 10
+				break
+			}
+		}
+	}
+	for _, kw := range otherOS(goos) {
+		if strings.Contains(n, kw) {
+			return -1, false
+		}
+	}
+
+	// Arch scoring. Reject hard mismatches.
+	archHits := map[string][]string{
+		"amd64": {"amd64", "x86_64", "x64"},
+		"arm64": {"arm64", "aarch64"},
+		"386":   {"i386", "i686", "x86"},
+		"arm":   {"armv7", "armhf", "armv6"},
+	}
+	if hits, ok := archHits[goarch]; ok {
+		for _, kw := range hits {
+			if strings.Contains(n, kw) {
+				s += 10
+				break
+			}
+		}
+	}
+	for arch, kws := range archHits {
+		if arch == goarch {
+			continue
+		}
+		for _, kw := range kws {
+			// Avoid false positives — "x86" is a substring of "x86_64", check word-ish boundaries.
+			if containsWord(n, kw) {
+				// "386" / "x86" misclassifies amd64 variants, so guard it.
+				if (kw == "x86" || kw == "i386" || kw == "i686") && goarch == "amd64" {
+					continue
+				}
+				return -1, false
+			}
+		}
+	}
+
+	// libc preference on Linux: prefer gnu/glibc over musl by default.
+	if goos == "linux" {
+		if strings.Contains(n, "musl") {
+			s -= 1
+		}
+		if strings.Contains(n, "gnu") || strings.Contains(n, "glibc") {
+			s += 1
+		}
+	}
+
+	return s, true
+}
+
+// containsWord returns true if needle appears in s bounded by non-alphanumeric chars
+// (or string edges). Avoids matching "x86" inside "x86_64".
+func containsWord(s, needle string) bool {
+	for i := 0; i+len(needle) <= len(s); i++ {
+		if s[i:i+len(needle)] != needle {
+			continue
+		}
+		left := i == 0 || !isAlnum(s[i-1])
+		right := i+len(needle) == len(s) || !isAlnum(s[i+len(needle)])
+		if left && right {
+			return true
+		}
+	}
+	return false
+}
+
+func isAlnum(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_'
+}
+
 func pickAsset(assets []Asset) (*Asset, error) {
 	if len(assets) == 0 {
 		return nil, fmt.Errorf("no release assets found")
 	}
 
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
-
-	type scored struct {
-		asset Asset
-		score int
+	bestScore := -1 << 30
+	var best *Asset
+	for i := range assets {
+		s, ok := scoreAsset(assets[i].Name)
+		if !ok {
+			continue
+		}
+		if s > bestScore {
+			bestScore = s
+			best = &assets[i]
+		}
 	}
+	if best == nil || bestScore < 10 {
+		return nil, fmt.Errorf("no compatible asset for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+	return best, nil
+}
 
-	var candidates []scored
+// findExpectedSum looks for a SHA-256 checksum for assetName among the release assets.
+// Returns the lowercase hex hash, or "" if no checksum file is found.
+func findExpectedSum(assets []Asset, assetName string) string {
+	lowerName := strings.ToLower(assetName)
+
+	// Pattern 1: a per-asset file like <asset>.sha256 / <asset>.sha256sum.
 	for _, a := range assets {
-		name := strings.ToLower(a.Name)
-		s := 0
-
-		// OS matching
-		switch goos {
-		case "darwin":
-			if strings.Contains(name, "darwin") || strings.Contains(name, "macos") || strings.Contains(name, "apple") {
-				s += 10
+		ln := strings.ToLower(a.Name)
+		if ln == lowerName+".sha256" || ln == lowerName+".sha256sum" {
+			if h := fetchSingleHash(a.URL); h != "" {
+				return h
 			}
-		case "linux":
-			if strings.Contains(name, "linux") {
-				s += 10
-			}
-		case "windows":
-			if strings.Contains(name, "windows") || strings.Contains(name, "win64") || strings.Contains(name, "win32") {
-				s += 10
-			}
-		}
-
-		// Arch matching
-		switch goarch {
-		case "arm64":
-			if strings.Contains(name, "arm64") || strings.Contains(name, "aarch64") {
-				s += 10
-			}
-		case "amd64":
-			if strings.Contains(name, "amd64") || strings.Contains(name, "x86_64") || strings.Contains(name, "x64") {
-				s += 10
-			}
-		}
-
-		// Format preference
-		if strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".tgz") {
-			s += 5
-		} else if strings.HasSuffix(name, ".zip") {
-			s += 3
-		}
-
-		// Negative signals — wrong OS or non-binary files
-		if goos != "linux" && strings.Contains(name, "linux") {
-			s -= 100
-		}
-		if goos != "windows" && (strings.Contains(name, "windows") || strings.Contains(name, "win64") || strings.Contains(name, "win32") || strings.Contains(name, ".exe") || strings.Contains(name, ".msi")) {
-			s -= 100
-		}
-		if goos != "darwin" && (strings.Contains(name, "darwin") || strings.Contains(name, "macos")) {
-			s -= 100
-		}
-		if strings.HasSuffix(name, ".sha256") || strings.HasSuffix(name, ".sig") ||
-			strings.HasSuffix(name, ".asc") || strings.HasSuffix(name, ".sbom") ||
-			strings.HasSuffix(name, ".txt") || strings.HasSuffix(name, ".json") {
-			s -= 100
-		}
-		// Wrong arch
-		if goarch == "arm64" && (strings.Contains(name, "amd64") || strings.Contains(name, "x86_64") || strings.Contains(name, "x64")) {
-			s -= 100
-		}
-		if goarch == "amd64" && (strings.Contains(name, "arm64") || strings.Contains(name, "aarch64")) {
-			s -= 100
-		}
-		// musl vs gnu — prefer gnu/default on non-musl systems
-		if strings.Contains(name, "musl") {
-			s -= 1
-		}
-
-		candidates = append(candidates, scored{a, s})
-	}
-
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no compatible assets found")
-	}
-
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.score > best.score {
-			best = c
 		}
 	}
 
-	if best.score < 0 {
-		return nil, fmt.Errorf("no compatible asset for %s/%s", goos, goarch)
+	// Pattern 2: an aggregate file like SHA256SUMS / checksums.txt / *_checksums.txt.
+	for _, a := range assets {
+		ln := strings.ToLower(filepath.Base(a.Name))
+		if ln == "sha256sums" || ln == "sha256sums.txt" || ln == "checksums.txt" ||
+			strings.HasSuffix(ln, "_checksums.txt") || strings.HasSuffix(ln, "-checksums.txt") ||
+			strings.HasSuffix(ln, ".sha256sums") {
+			if h := fetchSumFromList(a.URL, assetName); h != "" {
+				return h
+			}
+		}
 	}
 
-	return &best.asset, nil
+	return ""
+}
+
+// fetchSingleHash fetches a "<hash>  <name>" or "<hash>" file and returns the hash.
+func fetchSingleHash(url string) string {
+	resp, err := httpGet(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(body))
+	// Take first whitespace-separated token.
+	if i := strings.IndexAny(line, " \t\n"); i > 0 {
+		line = line[:i]
+	}
+	if isHex(line) && len(line) == 64 {
+		return strings.ToLower(line)
+	}
+	return ""
+}
+
+// fetchSumFromList fetches a SHA256SUMS-style file and returns the hash for assetName.
+func fetchSumFromList(url, assetName string) string {
+	resp, err := httpGet(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 1<<20))
+	target := strings.ToLower(assetName)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Format: "<hash>  <filename>" or "<hash> *<filename>"
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		hash := fields[0]
+		fname := strings.TrimPrefix(fields[len(fields)-1], "*")
+		if strings.ToLower(filepath.Base(fname)) == target && isHex(hash) && len(hash) == 64 {
+			return strings.ToLower(hash)
+		}
+	}
+	return ""
+}
+
+func isHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func shortHash(h string) string {
+	if len(h) > 12 {
+		return h[:12]
+	}
+	return h
 }
 
 func httpGet(url string) (*http.Response, error) {
@@ -615,34 +820,58 @@ func httpGet(url string) (*http.Response, error) {
 	return resp, nil
 }
 
-func download(url, dest string) error {
+// download writes url to dest and returns the SHA-256 of the bytes written.
+func download(url, dest string) (string, error) {
 	resp, err := httpGet(url)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	f, err := os.Create(dest)
 	if err != nil {
-		return err
+		return "", err
 	}
 
+	hasher := sha256.New()
 	bw := bufio.NewWriterSize(f, 256*1024)
-	_, copyErr := io.Copy(bw, io.LimitReader(resp.Body, 1<<30))
+	mw := io.MultiWriter(bw, hasher)
+	_, copyErr := io.Copy(mw, io.LimitReader(resp.Body, 1<<30))
 	flushErr := bw.Flush()
 	closeErr := f.Close()
 	if copyErr != nil {
-		return copyErr
+		return "", copyErr
 	}
 	if flushErr != nil {
-		return flushErr
+		return "", flushErr
 	}
-	return closeErr
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // --- Cellar ---
 
-// streamTarGz decompresses and extracts a tar.gz stream directly into dest.
+// safeJoin joins base and rel, ensuring the result stays under base
+// (defends against zip-slip / tar-slip).
+func safeJoin(base, rel string) (string, error) {
+	cleaned := filepath.Clean(rel)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "..") {
+		return "", fmt.Errorf("unsafe path %q", rel)
+	}
+	if filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("absolute path %q in archive", rel)
+	}
+	target := filepath.Join(base, cleaned)
+	if !strings.HasPrefix(target, base+string(os.PathSeparator)) && target != base {
+		return "", fmt.Errorf("escaping path %q", rel)
+	}
+	return target, nil
+}
+
+// streamTarGz decompresses and extracts a tar.gz stream into dest, preserving
+// directory structure.
 func streamTarGz(r io.Reader, dest string) error {
 	br := bufio.NewReaderSize(r, 128*1024)
 	gz, err := gzip.NewReader(br)
@@ -662,33 +891,40 @@ func streamTarGz(r io.Reader, dest string) error {
 			return err
 		}
 
-		if hdr.Typeflag == tar.TypeDir {
-			continue
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			continue
-		}
-
-		name := filepath.Base(hdr.Name)
-		if name == "." || name == ".." {
-			continue
-		}
-
-		target := filepath.Join(dest, name)
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode))
+		target, err := safeJoin(dest, hdr.Name)
 		if err != nil {
-			return err
+			continue
 		}
-		bw := bufio.NewWriter(out)
-		if _, err := io.CopyBuffer(bw, tr, buf); err != nil {
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			if err != nil {
+				return err
+			}
+			bw := bufio.NewWriter(out)
+			if _, err := io.CopyBuffer(bw, tr, buf); err != nil {
+				out.Close()
+				return err
+			}
+			if err := bw.Flush(); err != nil {
+				out.Close()
+				return err
+			}
 			out.Close()
-			return err
+			// Re-apply mode in case umask masked the executable bit.
+			os.Chmod(target, os.FileMode(hdr.Mode)&0o777)
+		case tar.TypeSymlink, tar.TypeLink:
+			// Skip — we only care about regular files.
+			continue
 		}
-		if err := bw.Flush(); err != nil {
-			out.Close()
-			return err
-		}
-		out.Close()
 	}
 	return nil
 }
@@ -702,23 +938,30 @@ func extractZip(archive, dest string) error {
 
 	buf := make([]byte, 256*1024)
 	for _, f := range r.File {
+		target, err := safeJoin(dest, f.Name)
+		if err != nil {
+			continue
+		}
 		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
 			continue
 		}
-
-		// Flatten
-		name := filepath.Base(f.Name)
-		if name == "." || name == ".." {
-			continue
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
 		}
 
-		target := filepath.Join(dest, name)
 		rc, err := f.Open()
 		if err != nil {
 			return err
 		}
 
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, f.Mode())
+		mode := f.Mode() & 0o777
+		if mode == 0 {
+			mode = 0o644
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 		if err != nil {
 			rc.Close()
 			return err
@@ -736,74 +979,100 @@ func extractZip(archive, dest string) error {
 		}
 		out.Close()
 		rc.Close()
+		os.Chmod(target, mode)
 	}
 	return nil
 }
 
+// detectBinaries walks dir and returns paths to executable binaries.
+// It prefers files under bin/ subdirectories; if any are found, only
+// those are returned to avoid linking ancillary tools at the archive root.
 func detectBinaries(dir string) ([]string, error) {
-	entries, err := os.ReadDir(dir)
+	var all []string
+	var inBin []string
+	seen := map[string]bool{}
+
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, ".") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.Mode()&0o111 == 0 {
+			return nil
+		}
+		if !isExecutableMagic(path) {
+			return nil
+		}
+		// De-dup by basename — first match wins.
+		if seen[name] {
+			return nil
+		}
+		seen[name] = true
+		all = append(all, path)
+
+		// Track whether this path is under a "bin" component.
+		rel, _ := filepath.Rel(dir, path)
+		parts := strings.Split(rel, string(os.PathSeparator))
+		for _, p := range parts[:len(parts)-1] {
+			if strings.EqualFold(p, "bin") {
+				inBin = append(inBin, path)
+				break
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	var magic [4]byte
-	var bins []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.Mode()&0o111 == 0 {
-			continue
-		}
-		path := filepath.Join(dir, name)
-
-		f, err := os.Open(path)
-		if err != nil {
-			continue
-		}
-		_, err = io.ReadFull(f, magic[:])
-		f.Close()
-		if err != nil {
-			continue
-		}
-
-		// ELF
-		if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
-			bins = append(bins, path)
-			continue
-		}
-		// Mach-O (32/64-bit, big/little endian)
-		if magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && (magic[3] == 0xce || magic[3] == 0xcf) {
-			bins = append(bins, path)
-			continue
-		}
-		if (magic[0] == 0xce || magic[0] == 0xcf) && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe {
-			bins = append(bins, path)
-			continue
-		}
-		// Mach-O fat/universal binary
-		if magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
-			bins = append(bins, path)
-			continue
-		}
-		// Windows PE
-		if magic[0] == 'M' && magic[1] == 'Z' {
-			bins = append(bins, path)
-			continue
-		}
+	if len(inBin) > 0 {
+		return inBin, nil
 	}
-	return bins, nil
+	return all, nil
 }
 
-func linkBins(name string, bins []string) error {
+func isExecutableMagic(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var magic [4]byte
+	if _, err := io.ReadFull(f, magic[:]); err != nil {
+		return false
+	}
+	// ELF
+	if magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F' {
+		return true
+	}
+	// Mach-O 32/64
+	if magic[0] == 0xfe && magic[1] == 0xed && magic[2] == 0xfa && (magic[3] == 0xce || magic[3] == 0xcf) {
+		return true
+	}
+	if (magic[0] == 0xce || magic[0] == 0xcf) && magic[1] == 0xfa && magic[2] == 0xed && magic[3] == 0xfe {
+		return true
+	}
+	// Mach-O fat/universal
+	if magic[0] == 0xca && magic[1] == 0xfe && magic[2] == 0xba && magic[3] == 0xbe {
+		return true
+	}
+	// Windows PE
+	if magic[0] == 'M' && magic[1] == 'Z' {
+		return true
+	}
+	return false
+}
+
+func linkBins(bins []string) error {
 	bdir := binDir()
 	if err := os.MkdirAll(bdir, 0o755); err != nil {
 		return err
@@ -811,34 +1080,39 @@ func linkBins(name string, bins []string) error {
 
 	for _, bin := range bins {
 		linkName := filepath.Join(bdir, filepath.Base(bin))
-		// Relative symlink: ../pkg/<name>/<binary>
-		relTarget := filepath.Join("..", "pkg", name, filepath.Base(bin))
-		os.Remove(linkName) // remove stale link
-		if err := os.Symlink(relTarget, linkName); err != nil {
+		rel, err := filepath.Rel(bdir, bin)
+		if err != nil {
+			rel = bin
+		}
+		os.Remove(linkName)
+		if err := os.Symlink(rel, linkName); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// unlinkBins removes any symlink in binDir whose resolved target points into pkgDir(name).
 func unlinkBins(name string) {
 	bdir := binDir()
 	pdir := pkgDir(name)
-	entries, err := os.ReadDir(pdir)
+	entries, err := os.ReadDir(bdir)
 	if err != nil {
 		return
 	}
-	prefix := filepath.Join("..", "pkg", name) + string(os.PathSeparator)
 	for _, e := range entries {
-		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-			continue
-		}
 		link := filepath.Join(bdir, e.Name())
 		target, err := os.Readlink(link)
 		if err != nil {
 			continue
 		}
-		if strings.HasPrefix(target, prefix) {
+		// Resolve relative symlinks against bdir.
+		resolved := target
+		if !filepath.IsAbs(resolved) {
+			resolved = filepath.Join(bdir, target)
+		}
+		resolved = filepath.Clean(resolved)
+		if resolved == pdir || strings.HasPrefix(resolved, pdir+string(os.PathSeparator)) {
 			os.Remove(link)
 		}
 	}
